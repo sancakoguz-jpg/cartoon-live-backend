@@ -1,68 +1,99 @@
 console.log("Server startet…");
+
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
 const { v4: uuidv4 } = require('uuid');
 const fs = require('fs');
 const path = require('path');
+const cloudinary = require('cloudinary').v2;
+require('dotenv').config(); // liest .env lokal ein
+
+// --- Cloudinary Konfiguration aus .env ---
+cloudinary.config({
+  cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+  api_key:    process.env.CLOUDINARY_API_KEY,
+  api_secret: process.env.CLOUDINARY_API_SECRET
+});
 
 const app = express();
-app.use(cors());              // In Produktion ggf. cors({ origin: ["https://DEINSHOP.de"] })
+
+// CORS: zunächst offen – später auf deine Shop-Domain(en) einschränken
+app.use(cors());
+// Beispiel für Produktion:
+// app.use(cors({ origin: ['https://deinshop.myshopify.com','https://deine-domain.de'] }));
+
 app.use(express.json());
 
-// Ordner für Ausgaben
+// (Optional) lokaler Output-Ordner – wird für Cloudinary nicht benötigt,
+// aber wir lassen ihn da, falls du später Dateien lokal ablegen willst.
 const OUTPUT_DIR = path.join(__dirname, 'outputs');
 if (!fs.existsSync(OUTPUT_DIR)) fs.mkdirSync(OUTPUT_DIR, { recursive: true });
 app.use('/outputs', express.static(OUTPUT_DIR));
 
-// Upload in Memory (max. 15 MB)
+// Upload (max 15 MB)
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 15 * 1024 * 1024 } });
 
-// Sehr einfache In-Memory Job-Map
+// Minimaler Job-Store
 const jobs = new Map(); // jobId -> { status, progress, resultUrl, error }
 
-// DEMO: simuliert Fortschritt und speichert das Original als "Ergebnis".
-// Später hier deine echte KI anschließen.
-async function cartoonizeImage(buffer, outPath, onProgress) {
-  function wait(ms) { return new Promise(r => setTimeout(r, ms)); }
-  let p = 0;
-  while (p < 95) {
-    p += 15;                 // 15,30,45,60,75,90,95
-    onProgress && onProgress(p);
-    await wait(600);
+// --- Cartoon-Umwandlung über Cloudinary ---
+async function cartoonizeImage(buffer, onProgress) {
+  try {
+    onProgress && onProgress(30);
+
+    // Bild als Data-URI senden (kein Temp-File nötig)
+    const base64Image = `data:image/png;base64,${buffer.toString('base64')}`;
+
+    // Cloudinary Upload + Cartoon-Transformation
+    const result = await cloudinary.uploader.upload(base64Image, {
+      folder: 'cartoon-uploads',
+      transformation: [
+        { effect: 'cartoonify' },   // Cartoon-Effekt
+        { effect: 'outline:100' }   // leichte Kontur
+      ]
+    });
+
+    onProgress && onProgress(90);
+
+    // Ergebnis-URL zurückgeben (CDN)
+    onProgress && onProgress(100);
+    return result.secure_url;
+  } catch (err) {
+    throw new Error(`Cloudinary-Fehler: ${err.message}`);
   }
-  fs.writeFileSync(outPath, buffer);   // Demo: Bild einfach abspeichern
-  onProgress && onProgress(100);
 }
 
+// --- API: Start der Umwandlung ---
 app.post('/api/convert', upload.single('image'), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: 'Kein Bild erhalten' });
 
     const jobId = uuidv4();
-    const outFile = path.join(OUTPUT_DIR, `${jobId}.png`);
     jobs.set(jobId, { status: 'processing', progress: 0, resultUrl: null });
 
-    // Verarbeitung asynchron starten
-    cartoonizeImage(req.file.buffer, outFile, (p) => {
+    // asynchron verarbeiten
+    cartoonizeImage(req.file.buffer, (p) => {
       const j = jobs.get(jobId);
       if (j) { j.progress = p; jobs.set(jobId, j); }
-    }).then(() => {
+    })
+    .then((cloudUrl) => {
       const j = jobs.get(jobId);
       if (j) {
         j.status = 'done';
         j.progress = 100;
-        j.resultUrl = `/outputs/${jobId}.png`;
+        j.resultUrl = cloudUrl; // <-- Cartoon-URL von Cloudinary
         jobs.set(jobId, j);
       }
-    }).catch(err => {
+    })
+    .catch((err) => {
       const j = jobs.get(jobId) || {};
       j.status = 'error';
-      j.error = err?.message || 'Processing failed';
+      j.error  = err?.message || 'Processing failed';
       jobs.set(jobId, j);
     });
 
-    // jobId sofort zurückgeben
+    // jobId sofort zurück
     res.json({ jobId });
 
   } catch (err) {
@@ -71,12 +102,14 @@ app.post('/api/convert', upload.single('image'), async (req, res) => {
   }
 });
 
+// --- API: Status abfragen ---
 app.get('/api/status/:jobId', (req, res) => {
   const job = jobs.get(req.params.jobId);
   if (!job) return res.status(404).json({ error: 'Job nicht gefunden' });
   res.json(job);
 });
 
+// --- Start ---
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`Backend läuft auf http://localhost:${PORT}`);
